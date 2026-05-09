@@ -236,14 +236,66 @@ def _unwrap_mcp_config(cfg: dict) -> tuple[dict, str | None]:
     return cfg, None
 
 
-def _parse_direct_config(cfg: dict) -> dict:
-    """Normalize a JSON config dict (mcp.json style) into submit-ready fields.
+def _parse_server_json_manifest(cfg: dict) -> dict | None:
+    """Parse a server.json manifest format (packages[]/remotes[] arrays).
 
-    Accepts wrapped (mcpServers) or bare configs.
+    Returns parsed dict if this looks like a server.json manifest, None otherwise.
+    """
+    if "packages" not in cfg and "remotes" not in cfg:
+        return None
+
+    parsed: dict = {}
+    env_vars: list[dict] = []
+
+    # packages[].runtimeArguments — Docker -e flags
+    for pkg in cfg.get("packages", []):
+        for arg in pkg.get("runtimeArguments", []):
+            value = arg.get("value", "")
+            # Pattern: "ENV_VAR={placeholder}" — extract the var name before '='
+            if "=" in value:
+                var_name = value.split("=", 1)[0]
+                if var_name and var_name == var_name.upper():
+                    desc = arg.get("description", "")
+                    env_vars.append({"name": var_name, "description": desc, "required": True})
+
+    # remotes[].variables — URL-interpolated secrets
+    for remote in cfg.get("remotes", []):
+        url = remote.get("url", "")
+        if url and not parsed.get("url"):
+            parsed["url"] = url
+            parsed["transport"] = remote.get("type", "sse")
+        for var_key, var_meta in (remote.get("variables") or {}).items():
+            desc = var_meta.get("description", "") if isinstance(var_meta, dict) else ""
+            env_vars.append({"name": var_key, "description": desc, "required": True})
+
+    if env_vars:
+        parsed["environment_variables"] = env_vars
+
+    # If we found a URL from remotes, this is an SSE/HTTP server
+    if not parsed.get("url"):
+        # Packages-only manifest implies stdio (Docker typically)
+        parsed["transport"] = "stdio"
+        parsed["framework"] = "docker"
+
+    return parsed
+
+
+def _parse_direct_config(cfg: dict) -> dict:
+    """Normalize a JSON config dict into submit-ready fields.
+
+    Accepts:
+    - IDE config: wrapped (mcpServers) or bare {command, args} / {url, type}
+    - server.json manifest: {packages: [...]} / {remotes: [...]}
+
     Handles two transport shapes:
     - stdio: {command, args, env}
     - SSE/HTTP: {url, type, headers, autoApprove}
     """
+    # Try server.json manifest format first
+    manifest_result = _parse_server_json_manifest(cfg)
+    if manifest_result is not None:
+        return manifest_result
+
     inner, server_name = _unwrap_mcp_config(cfg)
     parsed: dict = {}
     if server_name:
@@ -996,15 +1048,18 @@ def _delete_impl(mcp_id, yes):
 
 @mcp_app.command()
 def submit(
-    git_url: str = typer.Argument(None, help="Git repository URL (optional if --config used)"),
+    git_url: str = typer.Option(None, "--git", "-g", help="Analyze a git repository instead of pasting config"),
     name: str = typer.Option(None, "--name", "-n", help="Skip name prompt"),
     category: str = typer.Option(None, "--category", "-c", help="Skip category prompt"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Accept defaults from repo analysis"),
-    config: bool = typer.Option(False, "--config", help="Submit via direct JSON config (paste mode)"),
+    config: bool = typer.Option(False, "--config", hidden=True, help="(deprecated) JSON paste is now the default"),
     draft: bool = typer.Option(False, "--draft", help="Save as draft instead of submitting for review"),
     submit_draft: str | None = typer.Option(None, "--submit", help="Submit a draft for review (MCP ID)"),
 ):
-    """Submit an MCP server for review.
+    """Submit an MCP server to the registry.
+
+    By default, paste your server's JSON config (the same format you use in
+    your IDE). Use --git to analyze a git repository instead.
 
     Only submit servers you created or are the point-of-contact for.
     """
@@ -1021,11 +1076,12 @@ def submit(
             result = client.post(f"/api/v1/mcps/{resolved}/submit")
         rprint(f"[green]✓ Draft submitted for review![/green] ID: [bold]{result['id']}[/bold]")
         return
-    if not git_url and not config:
-        rprint("[red]Provide a git URL or use --config[/red]")
-        raise typer.Exit(1)
+    if config:
+        rprint("[dim]Note: --config is now the default. You can just run `observal mcp submit`.[/dim]")
     rprint("[dim]Note: Only submit components you created (private) or are the point-of-contact for (external).[/dim]")
-    _submit_impl(git_url, name, category, yes, config, draft=draft)
+    # Default is JSON paste (direct_config=True), unless --git is provided
+    direct_config = not git_url
+    _submit_impl(git_url, name, category, yes, direct_config, draft=draft)
 
 
 @mcp_app.command(name="list")

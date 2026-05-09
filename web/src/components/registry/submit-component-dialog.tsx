@@ -18,10 +18,138 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Info, Loader2, Plus, X } from "lucide-react";
+import { Check, Info, Loader2, Plus, X } from "lucide-react";
 import { toast } from "sonner";
 import type { RegistryType } from "@/lib/api";
 import { useRegistryList, useMyComponents, useWhoami } from "@/hooks/use-api";
+
+// ── JSON config parser (mirrors CLI _parse_direct_config) ───────
+
+interface ParsedMcpConfig {
+  serverName?: string;
+  command?: string;
+  args?: string[];
+  url?: string;
+  transport?: string;
+  framework?: string;
+  dockerImage?: string;
+  envVars: EnvVar[];
+  headers?: { name: string; value: string }[];
+  autoApprove?: string[];
+}
+
+function parseMcpConfigJson(raw: string): { parsed?: ParsedMcpConfig; error?: string } {
+  let cfg: Record<string, unknown>;
+  try {
+    cfg = JSON.parse(raw);
+  } catch {
+    return { error: "Invalid JSON" };
+  }
+
+  // server.json manifest format (packages[]/remotes[])
+  if (cfg.packages || cfg.remotes) {
+    return { parsed: parseServerJsonManifest(cfg) };
+  }
+
+  // Unwrap IDE config formats
+  const { inner, serverName } = unwrapMcpConfig(cfg);
+  const result: ParsedMcpConfig = { envVars: [] };
+  if (serverName) result.serverName = serverName;
+
+  if ((inner as Record<string, unknown>).url && !(inner as Record<string, unknown>).command) {
+    // SSE / streamable-http
+    const i = inner as Record<string, unknown>;
+    result.transport = (i.type as string) || "sse";
+    result.url = i.url as string;
+    const rawEnv = (i.env || {}) as Record<string, string>;
+    result.envVars = Object.keys(rawEnv).map((k) => ({ name: k, description: "", required: true }));
+    if (i.headers && typeof i.headers === "object") {
+      result.headers = Object.entries(i.headers as Record<string, string>).map(([k, v]) => ({ name: k, value: v }));
+    }
+    if (Array.isArray(i.autoApprove)) result.autoApprove = i.autoApprove as string[];
+  } else if ((inner as Record<string, unknown>).command) {
+    // stdio
+    const i = inner as Record<string, unknown>;
+    result.transport = "stdio";
+    result.command = i.command as string;
+    result.args = Array.isArray(i.args) ? (i.args as string[]) : [];
+    const rawEnv = (i.env || {}) as Record<string, string>;
+    result.envVars = Object.keys(rawEnv).map((k) => ({ name: k, description: "", required: true }));
+    // Derive framework
+    if (result.command === "docker") {
+      result.framework = "docker";
+      const lastNonFlag = [...result.args].reverse().find((a) => !a.startsWith("-"));
+      if (lastNonFlag) result.dockerImage = lastNonFlag;
+    } else if (result.command === "python" || result.command === "python3") {
+      result.framework = "python";
+    } else if (result.command === "npx" || result.command === "node") {
+      result.framework = "typescript";
+    }
+    if (Array.isArray(i.autoApprove)) result.autoApprove = i.autoApprove as string[];
+  } else {
+    return { error: "Could not detect command or url in config" };
+  }
+
+  return { parsed: result };
+}
+
+function parseServerJsonManifest(cfg: Record<string, unknown>): ParsedMcpConfig {
+  const result: ParsedMcpConfig = { envVars: [] };
+  const packages = Array.isArray(cfg.packages) ? cfg.packages : [];
+  const remotes = Array.isArray(cfg.remotes) ? cfg.remotes : [];
+
+  for (const pkg of packages) {
+    for (const arg of (pkg as Record<string, unknown[]>).runtimeArguments || []) {
+      const value = (arg as Record<string, string>).value || "";
+      if (value.includes("=")) {
+        const varName = value.split("=", 1)[0];
+        if (varName && varName === varName.toUpperCase()) {
+          result.envVars.push({ name: varName, description: (arg as Record<string, string>).description || "", required: true });
+        }
+      }
+    }
+  }
+
+  for (const remote of remotes) {
+    const r = remote as Record<string, unknown>;
+    if (r.url && !result.url) {
+      result.url = r.url as string;
+      result.transport = (r.type as string) || "sse";
+    }
+    for (const [key, meta] of Object.entries((r.variables || {}) as Record<string, unknown>)) {
+      const desc = meta && typeof meta === "object" ? ((meta as Record<string, string>).description || "") : "";
+      result.envVars.push({ name: key, description: desc, required: true });
+    }
+  }
+
+  if (!result.url) {
+    result.transport = "stdio";
+    result.framework = "docker";
+  }
+
+  return result;
+}
+
+function unwrapMcpConfig(cfg: Record<string, unknown>): { inner: Record<string, unknown>; serverName?: string } {
+  // Shape 1: {mcpServers: {name: config}}
+  if (cfg.mcpServers && typeof cfg.mcpServers === "object") {
+    const servers = cfg.mcpServers as Record<string, unknown>;
+    const keys = Object.keys(servers);
+    if (keys.length === 1 && typeof servers[keys[0]] === "object") {
+      return { inner: servers[keys[0]] as Record<string, unknown>, serverName: keys[0] };
+    }
+    return { inner: cfg };
+  }
+  // Shape 3: bare config
+  if (cfg.command || cfg.url || cfg.type) return { inner: cfg };
+  // Shape 2: single named key
+  const keys = Object.keys(cfg);
+  if (keys.length === 1 && typeof cfg[keys[0]] === "object") {
+    const inner = cfg[keys[0]] as Record<string, unknown>;
+    if (inner.command || inner.url || inner.type) return { inner, serverName: keys[0] };
+  }
+  return { inner: cfg };
+}
 
 const MCP_CATEGORIES = [
   "browser-automation", "cloud-platforms", "code-execution", "communication",
@@ -103,6 +231,10 @@ export function SubmitComponentDialog({
   const [supportedIdes, setSupportedIdes] = useState<string[]>(Array.isArray(d?.supported_ides) ? d.supported_ides as string[] : []);
 
   // ── MCP ─────────────────────────────────────────────────
+  const [mcpMode, setMcpMode] = useState<"json" | "manual">(editItem ? "manual" : "json");
+  const [jsonInput, setJsonInput] = useState("");
+  const [jsonError, setJsonError] = useState<string | null>(null);
+  const [jsonParsed, setJsonParsed] = useState(false);
   const [category, setCategory] = useState((d?.category as string) ?? "general");
   const [gitUrl, setGitUrl] = useState((d?.git_url as string) ?? "");
   const [command, setCommand] = useState((d?.command as string) ?? "");
@@ -154,12 +286,41 @@ export function SubmitComponentDialog({
     return merged;
   })();
 
+  function handleJsonInput(value: string) {
+    setJsonInput(value);
+    setJsonError(null);
+    setJsonParsed(false);
+    if (!value.trim()) return;
+
+    const { parsed, error } = parseMcpConfigJson(value);
+    if (error) {
+      setJsonError(error);
+      return;
+    }
+    if (!parsed) return;
+
+    // Populate form fields from parsed config
+    if (parsed.serverName && !name) setName(parsed.serverName);
+    if (parsed.command) setCommand(parsed.command);
+    if (parsed.args) setArgs(parsed.args.join(" "));
+    if (parsed.url) setMcpUrl(parsed.url);
+    if (parsed.transport) setTransport(parsed.transport);
+    if (parsed.framework) setFramework(parsed.framework);
+    if (parsed.dockerImage) setDockerImage(parsed.dockerImage);
+    if (parsed.envVars.length > 0) setEnvVars(parsed.envVars);
+    setJsonParsed(true);
+  }
+
   function reset() {
     setName("");
     setVersion("0.1.0");
     setDescription("");
     setOwnerInput("");
     setSupportedIdes([]);
+    setMcpMode(editItem ? "manual" : "json");
+    setJsonInput("");
+    setJsonError(null);
+    setJsonParsed(false);
     setCategory("general");
     setGitUrl("");
     setCommand("");
@@ -265,7 +426,12 @@ export function SubmitComponentDialog({
     if (!description) return "Description is required";
 
     if (type === "mcps" && !gitUrl && !command && !mcpUrl) {
-      return "At least one of Git URL, Command, or Server URL is required";
+      if (mcpMode === "json" && !jsonParsed) {
+        return "Paste a valid server config JSON";
+      }
+      if (mcpMode === "manual") {
+        return "At least one of Git URL, Command, or Server URL is required";
+      }
     }
     if (type === "prompts" && !template) {
       return "Template is required";
@@ -386,149 +552,198 @@ export function SubmitComponentDialog({
           {/* ── MCP-specific ──────────────────────────────── */}
           {type === "mcps" && (
             <>
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1.5">
-                  <Label>Category</Label>
-                  <Select value={category} onValueChange={setCategory}>
-                    <SelectTrigger><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      {MCP_CATEGORIES.map((c) => (
-                        <SelectItem key={c} value={c}>{c}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="space-y-1.5">
-                  <Label>Transport</Label>
-                  <Select value={transport || "auto"} onValueChange={(v) => setTransport(v === "auto" ? "" : v)}>
-                    <SelectTrigger><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="auto">Auto-detect</SelectItem>
-                      {MCP_TRANSPORTS.map((t) => (
-                        <SelectItem key={t} value={t}>{t}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
-
               <div className="space-y-1.5">
-                <Label htmlFor="mcp-git-url">Git URL</Label>
-                <Input
-                  id="mcp-git-url"
-                  value={gitUrl}
-                  onChange={(e) => setGitUrl(e.target.value)}
-                  placeholder="https://github.com/user/mcp-server"
-                />
+                <Label>Category</Label>
+                <Select value={category} onValueChange={setCategory}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {MCP_CATEGORIES.map((c) => (
+                      <SelectItem key={c} value={c}>{c}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1.5">
-                  <Label htmlFor="mcp-command">Command</Label>
-                  <Input
-                    id="mcp-command"
-                    value={command}
-                    onChange={(e) => setCommand(e.target.value)}
-                    placeholder="npx, uvx, node..."
-                  />
-                </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="mcp-args">Args</Label>
-                  <Input
-                    id="mcp-args"
-                    value={args}
-                    onChange={(e) => setArgs(e.target.value)}
-                    placeholder="space-separated args"
-                  />
-                </div>
-              </div>
+              {/* ── JSON paste mode (default) ─────────────── */}
+              {mcpMode === "json" && (
+                <>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="mcp-json">Server Config (JSON)</Label>
+                    <Textarea
+                      id="mcp-json"
+                      value={jsonInput}
+                      onChange={(e) => handleJsonInput(e.target.value)}
+                      placeholder={`Paste your MCP server config, e.g.:\n{\n  "mcpServers": {\n    "my-server": {\n      "command": "npx",\n      "args": ["-y", "@example/mcp-server"],\n      "env": { "API_KEY": "$API_KEY" }\n    }\n  }\n}`}
+                      rows={8}
+                      className="text-xs font-mono"
+                    />
+                    {jsonError && (
+                      <p className="text-xs text-destructive">{jsonError}</p>
+                    )}
+                    {jsonParsed && (
+                      <div className="flex items-center gap-1.5 text-xs text-green-600">
+                        <Check className="h-3 w-3" />
+                        <span>
+                          Config parsed: {command && `${command} `}{args && `${args} `}{mcpUrl && `${mcpUrl} `}
+                          {envVars.length > 0 && `(${envVars.length} env var${envVars.length > 1 ? "s" : ""})`}
+                        </span>
+                      </div>
+                    )}
+                  </div>
 
-              <div className="space-y-1.5">
-                <Label htmlFor="mcp-url">Server URL (SSE/HTTP)</Label>
-                <Input
-                  id="mcp-url"
-                  value={mcpUrl}
-                  onChange={(e) => setMcpUrl(e.target.value)}
-                  placeholder="http://localhost:3000/sse"
-                />
-              </div>
-
-              {!gitUrl && !command && !mcpUrl && (
-                <p className="text-xs text-destructive">
-                  At least one of Git URL, Command, or Server URL is required for submission.
-                </p>
+                  <button
+                    type="button"
+                    onClick={() => setMcpMode("manual")}
+                    className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2"
+                  >
+                    Switch to manual entry
+                  </button>
+                </>
               )}
 
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1.5">
-                  <Label>Framework</Label>
-                  <Select value={framework || "none"} onValueChange={(v) => setFramework(v === "none" ? "" : v)}>
-                    <SelectTrigger><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="none">None</SelectItem>
-                      {MCP_FRAMEWORKS.map((f) => (
-                        <SelectItem key={f} value={f}>{f}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="mcp-docker">Docker Image</Label>
-                  <Input
-                    id="mcp-docker"
-                    value={dockerImage}
-                    onChange={(e) => setDockerImage(e.target.value)}
-                    placeholder="user/image:tag"
-                  />
-                </div>
-              </div>
+              {/* ── Manual mode (field-by-field) ──────────── */}
+              {mcpMode === "manual" && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setMcpMode("json")}
+                    className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2"
+                  >
+                    Switch to paste config
+                  </button>
 
-              {/* Environment Variables */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <Label>Environment Variables</Label>
-                  <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={addEnvVar}>
-                    <Plus className="h-3 w-3 mr-1" /> Add
-                  </Button>
-                </div>
-                {envVars.map((ev, i) => (
-                  <div key={i} className="flex items-center gap-2">
-                    <Input
-                      value={ev.name}
-                      onChange={(e) => updateEnvVar(i, "name", e.target.value)}
-                      placeholder="ENV_NAME"
-                      className="flex-1 h-8 text-xs font-mono"
-                    />
-                    <Input
-                      value={ev.description}
-                      onChange={(e) => updateEnvVar(i, "description", e.target.value)}
-                      placeholder="Description"
-                      className="flex-1 h-8 text-xs"
-                    />
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      className="h-7 w-7 p-0 shrink-0"
-                      onClick={() => removeEnvVar(i)}
-                    >
-                      <X className="h-3 w-3" />
-                    </Button>
+                  <div className="space-y-1.5">
+                    <Label>Transport</Label>
+                    <Select value={transport || "auto"} onValueChange={(v) => setTransport(v === "auto" ? "" : v)}>
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="auto">Auto-detect</SelectItem>
+                        {MCP_TRANSPORTS.map((t) => (
+                          <SelectItem key={t} value={t}>{t}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
                   </div>
-                ))}
-              </div>
 
-              <div className="space-y-1.5">
-                <Label htmlFor="mcp-setup">Setup Instructions</Label>
-                <Textarea
-                  id="mcp-setup"
-                  value={setupInstructions}
-                  onChange={(e) => setSetupInstructions(e.target.value)}
-                  placeholder="Steps to configure this MCP server..."
-                  rows={3}
-                  className="text-sm"
-                />
-              </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="mcp-git-url">Git URL</Label>
+                    <Input
+                      id="mcp-git-url"
+                      value={gitUrl}
+                      onChange={(e) => setGitUrl(e.target.value)}
+                      placeholder="https://github.com/user/mcp-server"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <Label htmlFor="mcp-command">Command</Label>
+                      <Input
+                        id="mcp-command"
+                        value={command}
+                        onChange={(e) => setCommand(e.target.value)}
+                        placeholder="npx, uvx, node..."
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label htmlFor="mcp-args">Args</Label>
+                      <Input
+                        id="mcp-args"
+                        value={args}
+                        onChange={(e) => setArgs(e.target.value)}
+                        placeholder="space-separated args"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <Label htmlFor="mcp-url">Server URL (SSE/HTTP)</Label>
+                    <Input
+                      id="mcp-url"
+                      value={mcpUrl}
+                      onChange={(e) => setMcpUrl(e.target.value)}
+                      placeholder="http://localhost:3000/sse"
+                    />
+                  </div>
+
+                  {!gitUrl && !command && !mcpUrl && (
+                    <p className="text-xs text-destructive">
+                      At least one of Git URL, Command, or Server URL is required for submission.
+                    </p>
+                  )}
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <Label>Framework</Label>
+                      <Select value={framework || "none"} onValueChange={(v) => setFramework(v === "none" ? "" : v)}>
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="none">None</SelectItem>
+                          {MCP_FRAMEWORKS.map((f) => (
+                            <SelectItem key={f} value={f}>{f}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label htmlFor="mcp-docker">Docker Image</Label>
+                      <Input
+                        id="mcp-docker"
+                        value={dockerImage}
+                        onChange={(e) => setDockerImage(e.target.value)}
+                        placeholder="user/image:tag"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Environment Variables */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <Label>Environment Variables</Label>
+                      <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={addEnvVar}>
+                        <Plus className="h-3 w-3 mr-1" /> Add
+                      </Button>
+                    </div>
+                    {envVars.map((ev, i) => (
+                      <div key={i} className="flex items-center gap-2">
+                        <Input
+                          value={ev.name}
+                          onChange={(e) => updateEnvVar(i, "name", e.target.value)}
+                          placeholder="ENV_NAME"
+                          className="flex-1 h-8 text-xs font-mono"
+                        />
+                        <Input
+                          value={ev.description}
+                          onChange={(e) => updateEnvVar(i, "description", e.target.value)}
+                          placeholder="Description"
+                          className="flex-1 h-8 text-xs"
+                        />
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 w-7 p-0 shrink-0"
+                          onClick={() => removeEnvVar(i)}
+                        >
+                          <X className="h-3 w-3" />
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <Label htmlFor="mcp-setup">Setup Instructions</Label>
+                    <Textarea
+                      id="mcp-setup"
+                      value={setupInstructions}
+                      onChange={(e) => setSetupInstructions(e.target.value)}
+                      placeholder="Steps to configure this MCP server..."
+                      rows={3}
+                      className="text-sm"
+                    />
+                  </div>
+                </>
+              )}
             </>
           )}
 
