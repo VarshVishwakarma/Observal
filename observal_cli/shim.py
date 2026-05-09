@@ -371,12 +371,52 @@ async def run_shim(mcp_id: str, command: list[str]):
     state = ShimState(mcp_id, server_url, access_token, agent_id)
 
     # Spawn the real MCP process
-    proc = await asyncio.create_subprocess_exec(
-        *command,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        error_notification = json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {
+                "level": "error",
+                "logger": "observal-shim",
+                "data": f"MCP server failed to start: {error_msg}",
+            },
+        }) + "\n"
+        sys.stdout.buffer.write(error_notification.encode())
+        sys.stdout.buffer.flush()
+        sys.stderr.write(f"[observal-shim] MCP failed to start: {error_msg}\n")
+        sys.stderr.flush()
+        return 1
+
+    # Startup health check: catch immediate crashes (missing module, bad
+    # command, permission denied) before setting up the relay.
+    await asyncio.sleep(0.3)
+    if proc.returncode is not None:
+        stderr_output = await proc.stderr.read()
+        error_msg = stderr_output.decode(errors="replace").strip()
+        if not error_msg:
+            error_msg = f"MCP process exited immediately with code {proc.returncode}"
+        error_notification = json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {
+                "level": "error",
+                "logger": "observal-shim",
+                "data": f"MCP server failed to start: {error_msg}",
+            },
+        }) + "\n"
+        sys.stdout.buffer.write(error_notification.encode())
+        sys.stdout.buffer.flush()
+        sys.stderr.write(f"[observal-shim] MCP failed to start: {error_msg}\n")
+        sys.stderr.flush()
+        return proc.returncode
 
     # Set up IDE stdin reader.
     # On Windows, connect_read_pipe / connect_write_pipe don't work with
@@ -404,12 +444,16 @@ async def run_shim(mcp_id: str, command: list[str]):
     ide_queue = await _read_messages(ide_reader)
     mcp_queue = await _read_messages(proc.stdout)
 
-    # Forward stderr
+    # Forward stderr (captured for error reporting on crash)
+    stderr_lines: list[str] = []
+
     async def _forward_stderr():
         while True:
             data = await proc.stderr.read(65536)
             if not data:
                 break
+            text = data.decode(errors="replace")
+            stderr_lines.append(text)
             sys.stderr.buffer.write(data)
             sys.stderr.buffer.flush()
 
@@ -426,7 +470,26 @@ async def run_shim(mcp_id: str, command: list[str]):
         stderr_task.cancel()
         await state.send_final()
 
-    return await proc.wait()
+    rc = proc.returncode if proc.returncode is not None else await proc.wait()
+    if rc != 0:
+        captured = "".join(stderr_lines).strip()
+        error_msg = captured[-500:] if captured else f"Process exited with code {rc}"
+        error_notification = json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {
+                "level": "error",
+                "logger": "observal-shim",
+                "data": f"MCP server crashed: {error_msg}",
+            },
+        }) + "\n"
+        if ide_stdout is not None:
+            ide_stdout.write(error_notification.encode())
+            await ide_stdout.drain()
+        else:
+            sys.stdout.buffer.write(error_notification.encode())
+            sys.stdout.buffer.flush()
+    return rc
 
 
 def main():
