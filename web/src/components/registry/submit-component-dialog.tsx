@@ -231,7 +231,7 @@ export function SubmitComponentDialog({
   const [supportedIdes, setSupportedIdes] = useState<string[]>(Array.isArray(d?.supported_ides) ? d.supported_ides as string[] : []);
 
   // ── MCP ─────────────────────────────────────────────────
-  const [mcpMode, setMcpMode] = useState<"json" | "manual">(editItem ? "manual" : "json");
+  const [mcpMode, setMcpMode] = useState<"json" | "manual">("json");
   const [jsonInput, setJsonInput] = useState("");
   const [jsonError, setJsonError] = useState<string | null>(null);
   const [jsonParsed, setJsonParsed] = useState(false);
@@ -286,6 +286,15 @@ export function SubmitComponentDialog({
     return merged;
   })();
 
+  function bumpPatchVersion(ver: string): string {
+    const parts = ver.split(".");
+    if (parts.length === 3) {
+      const patch = parseInt(parts[2], 10);
+      if (!isNaN(patch)) return `${parts[0]}.${parts[1]}.${patch + 1}`;
+    }
+    return ver;
+  }
+
   function handleJsonInput(value: string) {
     setJsonInput(value);
     setJsonError(null);
@@ -299,15 +308,28 @@ export function SubmitComponentDialog({
     }
     if (!parsed) return;
 
-    // Populate form fields from parsed config
-    if (parsed.serverName && !name) setName(parsed.serverName);
-    if (parsed.command) setCommand(parsed.command);
-    if (parsed.args) setArgs(parsed.args.join(" "));
-    if (parsed.url) setMcpUrl(parsed.url);
-    if (parsed.transport) setTransport(parsed.transport);
-    if (parsed.framework) setFramework(parsed.framework);
-    if (parsed.dockerImage) setDockerImage(parsed.dockerImage);
-    if (parsed.envVars.length > 0) setEnvVars(parsed.envVars);
+    // In edit mode, overwrite all fields from parsed config and bump version
+    if (isEditMode) {
+      if (parsed.serverName) setName(parsed.serverName);
+      setCommand(parsed.command || "");
+      setArgs(parsed.args ? parsed.args.join(" ") : "");
+      setMcpUrl(parsed.url || "");
+      setTransport(parsed.transport || "");
+      setFramework(parsed.framework || "");
+      setDockerImage(parsed.dockerImage || "");
+      setEnvVars(parsed.envVars.length > 0 ? parsed.envVars : []);
+      setVersion(bumpPatchVersion(version));
+    } else {
+      // New submission: only fill blank fields
+      if (parsed.serverName && !name) setName(parsed.serverName);
+      if (parsed.command) setCommand(parsed.command);
+      if (parsed.args) setArgs(parsed.args.join(" "));
+      if (parsed.url) setMcpUrl(parsed.url);
+      if (parsed.transport) setTransport(parsed.transport);
+      if (parsed.framework) setFramework(parsed.framework);
+      if (parsed.dockerImage) setDockerImage(parsed.dockerImage);
+      if (parsed.envVars.length > 0) setEnvVars(parsed.envVars);
+    }
     setJsonParsed(true);
   }
 
@@ -317,7 +339,7 @@ export function SubmitComponentDialog({
     setDescription("");
     setOwnerInput("");
     setSupportedIdes([]);
-    setMcpMode(editItem ? "manual" : "json");
+    setMcpMode("json");
     setJsonInput("");
     setJsonError(null);
     setJsonParsed(false);
@@ -426,8 +448,15 @@ export function SubmitComponentDialog({
     if (!description) return "Description is required";
 
     if (type === "mcps" && !gitUrl && !command && !mcpUrl) {
-      if (mcpMode === "json" && !jsonParsed) {
+      if (mcpMode === "json" && !jsonParsed && !isEditMode) {
         return "Paste a valid server config JSON";
+      }
+      if (mcpMode === "json" && !jsonParsed && isEditMode) {
+        // Edit mode: existing fields from editItem are still valid
+        const d = editItem as Record<string, unknown> | null;
+        if (!d?.command && !d?.url && !d?.git_url) {
+          return "Paste a new server config JSON to update";
+        }
       }
       if (mcpMode === "manual") {
         return "At least one of Git URL, Command, or Server URL is required";
@@ -568,12 +597,16 @@ export function SubmitComponentDialog({
               {mcpMode === "json" && (
                 <>
                   <div className="space-y-1.5">
-                    <Label htmlFor="mcp-json">Server Config (JSON)</Label>
+                    <Label htmlFor="mcp-json">
+                      {isEditMode ? "Paste Updated Config (JSON)" : "Server Config (JSON)"}
+                    </Label>
                     <Textarea
                       id="mcp-json"
                       value={jsonInput}
                       onChange={(e) => handleJsonInput(e.target.value)}
-                      placeholder={`Paste your MCP server config, e.g.:\n{\n  "mcpServers": {\n    "my-server": {\n      "command": "npx",\n      "args": ["-y", "@example/mcp-server"],\n      "env": { "API_KEY": "$API_KEY" }\n    }\n  }\n}`}
+                      placeholder={isEditMode
+                        ? `Paste the new server config to update this MCP:\n{\n  "mcpServers": {\n    "${name || "my-server"}": {\n      "command": "npx",\n      "args": ["-y", "@example/mcp-server@latest"],\n      "env": { "API_KEY": "$API_KEY" }\n    }\n  }\n}`
+                        : `Paste your MCP server config, e.g.:\n{\n  "mcpServers": {\n    "my-server": {\n      "command": "npx",\n      "args": ["-y", "@example/mcp-server"],\n      "env": { "API_KEY": "$API_KEY" }\n    }\n  }\n}`}
                       rows={8}
                       className="text-xs font-mono"
                     />
@@ -584,8 +617,9 @@ export function SubmitComponentDialog({
                       <div className="flex items-center gap-1.5 text-xs text-green-600">
                         <Check className="h-3 w-3" />
                         <span>
-                          Config parsed: {command && `${command} `}{args && `${args} `}{mcpUrl && `${mcpUrl} `}
+                          {isEditMode ? "Config updated" : "Config parsed"}: {command && `${command} `}{args && `${args} `}{mcpUrl && `${mcpUrl} `}
                           {envVars.length > 0 && `(${envVars.length} env var${envVars.length > 1 ? "s" : ""})`}
+                          {isEditMode && ` — version bumped to ${version}`}
                         </span>
                       </div>
                     )}
