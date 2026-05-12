@@ -27,6 +27,7 @@ import { useRegistryList, useMyComponents, useWhoami } from "@/hooks/use-api";
 
 interface ParsedMcpConfig {
   serverName?: string;
+  description?: string;
   command?: string;
   args?: string[];
   url?: string;
@@ -46,9 +47,23 @@ function parseMcpConfigJson(raw: string): { parsed?: ParsedMcpConfig; error?: st
     return { error: "Invalid JSON" };
   }
 
+  // Registry format: {server: {remotes: [...]}, _meta: {...}}
+  let manifest = cfg;
+  const serverMeta = cfg.server as Record<string, unknown> | undefined;
+  if (serverMeta && typeof serverMeta === "object" && ((serverMeta as Record<string, unknown>).remotes || (serverMeta as Record<string, unknown>).packages)) {
+    manifest = serverMeta as Record<string, unknown>;
+  }
+
   // server.json manifest format (packages[]/remotes[])
-  if (cfg.packages || cfg.remotes) {
-    return { parsed: parseServerJsonManifest(cfg) };
+  if (manifest.packages || manifest.remotes) {
+    const result = parseServerJsonManifest(manifest);
+    if (serverMeta && typeof serverMeta === "object") {
+      const regName = (serverMeta as Record<string, string>).title || (serverMeta as Record<string, string>).name;
+      if (regName) result.serverName = regName;
+      const regDesc = (serverMeta as Record<string, string>).description;
+      if (regDesc) result.description = regDesc;
+    }
+    return { parsed: result };
   }
 
   // Unwrap IDE config formats
@@ -311,6 +326,7 @@ export function SubmitComponentDialog({
     // In edit mode, overwrite all fields from parsed config and bump version
     if (isEditMode) {
       if (parsed.serverName) setName(parsed.serverName);
+      if (parsed.description) setDescription(parsed.description);
       setCommand(parsed.command || "");
       setArgs(parsed.args ? parsed.args.join(" ") : "");
       setMcpUrl(parsed.url || "");
@@ -322,6 +338,7 @@ export function SubmitComponentDialog({
     } else {
       // New submission: only fill blank fields
       if (parsed.serverName && !name) setName(parsed.serverName);
+      if (parsed.description && !description) setDescription(parsed.description);
       if (parsed.command) setCommand(parsed.command);
       if (parsed.args) setArgs(parsed.args.join(" "));
       if (parsed.url) setMcpUrl(parsed.url);
