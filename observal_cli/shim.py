@@ -380,15 +380,20 @@ async def run_shim(mcp_id: str, command: list[str]):
         )
     except (FileNotFoundError, PermissionError, OSError) as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
-        error_notification = json.dumps({
-            "jsonrpc": "2.0",
-            "method": "notifications/message",
-            "params": {
-                "level": "error",
-                "logger": "observal-shim",
-                "data": f"MCP server failed to start: {error_msg}",
-            },
-        }) + "\n"
+        error_notification = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/message",
+                    "params": {
+                        "level": "error",
+                        "logger": "observal-shim",
+                        "data": f"MCP server failed to start: {error_msg}",
+                    },
+                }
+            )
+            + "\n"
+        )
         sys.stdout.buffer.write(error_notification.encode())
         sys.stdout.buffer.flush()
         sys.stderr.write(f"[observal-shim] MCP failed to start: {error_msg}\n")
@@ -403,15 +408,20 @@ async def run_shim(mcp_id: str, command: list[str]):
         error_msg = stderr_output.decode(errors="replace").strip()
         if not error_msg:
             error_msg = f"MCP process exited immediately with code {proc.returncode}"
-        error_notification = json.dumps({
-            "jsonrpc": "2.0",
-            "method": "notifications/message",
-            "params": {
-                "level": "error",
-                "logger": "observal-shim",
-                "data": f"MCP server failed to start: {error_msg}",
-            },
-        }) + "\n"
+        error_notification = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/message",
+                    "params": {
+                        "level": "error",
+                        "logger": "observal-shim",
+                        "data": f"MCP server failed to start: {error_msg}",
+                    },
+                }
+            )
+            + "\n"
+        )
         sys.stdout.buffer.write(error_notification.encode())
         sys.stdout.buffer.flush()
         sys.stderr.write(f"[observal-shim] MCP failed to start: {error_msg}\n")
@@ -474,15 +484,20 @@ async def run_shim(mcp_id: str, command: list[str]):
     if rc != 0:
         captured = "".join(stderr_lines).strip()
         error_msg = captured[-500:] if captured else f"Process exited with code {rc}"
-        error_notification = json.dumps({
-            "jsonrpc": "2.0",
-            "method": "notifications/message",
-            "params": {
-                "level": "error",
-                "logger": "observal-shim",
-                "data": f"MCP server crashed: {error_msg}",
-            },
-        }) + "\n"
+        error_notification = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/message",
+                    "params": {
+                        "level": "error",
+                        "logger": "observal-shim",
+                        "data": f"MCP server crashed: {error_msg}",
+                    },
+                }
+            )
+            + "\n"
+        )
         if ide_stdout is not None:
             ide_stdout.write(error_notification.encode())
             await ide_stdout.drain()
