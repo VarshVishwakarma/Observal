@@ -8,6 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
+import { parseMcpConfigJson } from "@/lib/mcp-parser";
 import {
   Dialog,
   DialogContent,
@@ -83,135 +84,6 @@ interface PromptFieldState {
   tags: string;
 }
 
-// ── MCP JSON parser (mirrors submit-component-dialog) ──────────────
-
-interface ParsedMcpConfig {
-  serverName?: string;
-  description?: string;
-  command?: string;
-  args?: string[];
-  url?: string;
-  transport?: string;
-  framework?: string;
-  dockerImage?: string;
-  envVars: { name: string; description: string; required: boolean }[];
-  headers?: { name: string; value: string }[];
-  autoApprove?: string[];
-}
-
-function parseMcpConfigJson(raw: string): { parsed?: ParsedMcpConfig; error?: string } {
-  let cfg: Record<string, unknown>;
-  try {
-    cfg = JSON.parse(raw);
-  } catch {
-    return { error: "Invalid JSON" };
-  }
-
-  // Registry format: {server: {remotes: [...]}, _meta: {...}}
-  let manifest = cfg;
-  const serverMeta = cfg.server as Record<string, unknown> | undefined;
-  if (serverMeta && typeof serverMeta === "object" && ((serverMeta as Record<string, unknown>).remotes || (serverMeta as Record<string, unknown>).packages)) {
-    manifest = serverMeta as Record<string, unknown>;
-  }
-
-  // server.json manifest format (packages[]/remotes[])
-  if (manifest.packages || manifest.remotes) {
-    const result = parseServerJsonManifest(manifest);
-    // Extract name/description from registry metadata
-    if (serverMeta && typeof serverMeta === "object") {
-      const regName = (serverMeta as Record<string, string>).title || (serverMeta as Record<string, string>).name;
-      if (regName) result.serverName = regName;
-      const regDesc = (serverMeta as Record<string, string>).description;
-      if (regDesc) result.description = regDesc;
-    }
-    return { parsed: result };
-  }
-
-  // Unwrap IDE config formats
-  const { inner, serverName } = unwrapMcpConfig(cfg);
-  const result: ParsedMcpConfig = { envVars: [] };
-  if (serverName) result.serverName = serverName;
-
-  if ((inner as Record<string, unknown>).url && !(inner as Record<string, unknown>).command) {
-    const i = inner as Record<string, unknown>;
-    result.transport = (i.type as string) || "sse";
-    result.url = i.url as string;
-    const rawEnv = (i.env || {}) as Record<string, string>;
-    result.envVars = Object.keys(rawEnv).map((k) => ({ name: k, description: "", required: true }));
-    if (i.headers && typeof i.headers === "object") {
-      result.headers = Object.entries(i.headers as Record<string, string>).map(([k, v]) => ({ name: k, value: v }));
-    }
-  } else if ((inner as Record<string, unknown>).command) {
-    const i = inner as Record<string, unknown>;
-    result.transport = "stdio";
-    result.command = i.command as string;
-    result.args = Array.isArray(i.args) ? (i.args as string[]) : [];
-    const rawEnv = (i.env || {}) as Record<string, string>;
-    result.envVars = Object.keys(rawEnv).map((k) => ({ name: k, description: "", required: true }));
-    if (result.command === "docker") result.framework = "docker";
-    else if (result.command === "python" || result.command === "python3") result.framework = "python";
-    else if (result.command === "npx" || result.command === "node") result.framework = "typescript";
-  } else {
-    return { error: "Could not detect command or url in config" };
-  }
-
-  return { parsed: result };
-}
-
-function parseServerJsonManifest(cfg: Record<string, unknown>): ParsedMcpConfig {
-  const result: ParsedMcpConfig = { envVars: [] };
-  const packages = Array.isArray(cfg.packages) ? cfg.packages : [];
-  const remotes = Array.isArray(cfg.remotes) ? cfg.remotes : [];
-
-  for (const pkg of packages) {
-    for (const arg of ((pkg as Record<string, unknown[]>).runtimeArguments || [])) {
-      const value = (arg as Record<string, string>).value || "";
-      if (value.includes("=")) {
-        const varName = value.split("=", 1)[0];
-        if (varName && varName === varName.toUpperCase()) {
-          result.envVars.push({ name: varName, description: (arg as Record<string, string>).description || "", required: true });
-        }
-      }
-    }
-  }
-
-  for (const remote of remotes) {
-    const r = remote as Record<string, unknown>;
-    if (r.url && !result.url) {
-      result.url = r.url as string;
-      result.transport = (r.type as string) || "sse";
-    }
-    for (const [key, meta] of Object.entries((r.variables || {}) as Record<string, unknown>)) {
-      const desc = meta && typeof meta === "object" ? ((meta as Record<string, string>).description || "") : "";
-      result.envVars.push({ name: key, description: desc, required: true });
-    }
-  }
-
-  if (!result.url) {
-    result.transport = "stdio";
-    result.framework = "docker";
-  }
-
-  return result;
-}
-
-function unwrapMcpConfig(cfg: Record<string, unknown>): { inner: Record<string, unknown>; serverName?: string } {
-  if (cfg.mcpServers && typeof cfg.mcpServers === "object") {
-    const servers = cfg.mcpServers as Record<string, unknown>;
-    const keys = Object.keys(servers);
-    if (keys.length === 1 && typeof servers[keys[0]] === "object") {
-      return { inner: servers[keys[0]] as Record<string, unknown>, serverName: keys[0] };
-    }
-    return { inner: cfg };
-  }
-  if (cfg.command || cfg.url || cfg.type) return { inner: cfg };
-  const keys = Object.keys(cfg);
-  if (keys.length === 1 && typeof cfg[keys[0]] === "object") {
-    const inner = cfg[keys[0]] as Record<string, unknown>;
-    if (inner.command || inner.url || inner.type) return { inner, serverName: keys[0] };
-  }
-  return { inner: cfg };
-}
 
 // ── MCP Edit Form ──────────────────────────────────────────────────
 
@@ -249,8 +121,17 @@ function McpEditForm({
   const { data: versionSuggestions } = useComponentVersionSuggestions(type, listingId);
 
   const isDirty = useMemo(() => {
-    return jsonParsed || changelog.trim() !== "" || description !== ((item.description as string) ?? "");
-  }, [jsonParsed, changelog, description, item.description]);
+    return (
+      jsonParsed ||
+      changelog.trim() !== "" ||
+      description !== ((item.description as string) ?? "") ||
+      command !== ((item.command as string) ?? "") ||
+      args !== (Array.isArray(item.args) ? (item.args as string[]).join(" ") : "") ||
+      mcpUrl !== ((item.url as string) ?? "") ||
+      transport !== ((item.transport as string) ?? "") ||
+      framework !== ((item.framework as string) ?? "")
+    );
+  }, [jsonParsed, changelog, description, command, args, mcpUrl, transport, framework, item]);
 
   function handleJsonInput(value: string) {
     setJsonInput(value);
